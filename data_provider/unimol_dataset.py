@@ -4,11 +4,16 @@ import torch
 import random
 import lmdb
 import pickle
+
+from dictionary import Dictionary
 from functools import lru_cache
 from unicore.data import data_utils
 from scipy.spatial import distance_matrix
 from torch.utils.data import Dataset
+from LDMol.utils import AE_SMILES_encoder, regexTokenizer
+from mol_text_align import init_tokenizer
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class LMDBDataset_cid:
     def __init__(self, db_path):
@@ -40,7 +45,7 @@ class LMDBDataset_cid:
     def __getitem__(self, cid):
         if not hasattr(self, "env"):
             self.connect_db(self.db_path, save_to_self=True)
-        datapoint_pickled = self.env.begin().get(f"{cid}".rjust(9, '0').encode("ascii"))
+        datapoint_pickled = self.env.begin().get(cid.encode())
         data = pickle.loads(datapoint_pickled)
         return data
 
@@ -67,11 +72,13 @@ class D3Dataset_cid(Dataset):
 
     def __getitem__(self, cid):
         data = self.lmdb_dataset[cid]
-        smiles = data['smi']
+        smiles = data['smiles']
+        description = data['description']
+        enriched_description = data['enriched_description']
         ## deal with 3d coordinates
         atoms_orig = np.array(data['atoms'])
         atoms = atoms_orig.copy()
-        coordinate_set = data['coordinates_list']
+        coordinate_set = data['coordinates']
         coordinates = random.sample(coordinate_set, 1)[0].astype(np.float32)
         assert len(atoms) == len(coordinates) and len(atoms) > 0
         assert coordinates.shape[1] == 3
@@ -79,7 +86,7 @@ class D3Dataset_cid(Dataset):
         ## deal with the hydrogen
         if self.remove_hydrogen:
             mask_hydrogen = atoms != "H"
-            if len(mask_hydrogen) < len(atoms):
+            if sum(mask_hydrogen) > 0:
                 atoms = atoms[mask_hydrogen]
                 coordinates = coordinates[mask_hydrogen]
 
@@ -115,10 +122,10 @@ class D3Dataset_cid(Dataset):
         edge_type = atom_vec.view(-1, 1) * self.num_types + atom_vec.view(1, -1)
         dist = distance_matrix(coordinates, coordinates).astype(np.float32)
         coordinates, dist = torch.from_numpy(coordinates), torch.from_numpy(dist)
-        return atom_vec, coordinates, edge_type, dist, smiles
+        return atom_vec, coordinates, edge_type, dist, smiles, description, enriched_description
 
 
-class LMDBDataset:
+class LMDBDataset_index:
     def __init__(self, db_path):
         self.db_path = db_path
         assert os.path.isfile(self.db_path), "{} not found".format(self.db_path)
@@ -148,20 +155,20 @@ class LMDBDataset:
     def __getitem__(self, idx):
         if not hasattr(self, "env"):
             self.connect_db(self.db_path, save_to_self=True)
-        datapoint_pickled = self.env.begin().get(f"{idx}".encode("ascii"))
+        datapoint_pickled = self.env.begin().get(idx.encode())
         data = pickle.loads(datapoint_pickled)
         return data
 
 
-class D3Dataset(Dataset):
+class D3Dataset_index(Dataset):
     def __init__(self, path, dictionary, max_atoms=256):
         self.dictionary = dictionary
         self.num_types = len(dictionary)
         self.bos = dictionary.bos()
         self.eos = dictionary.eos()
-        
-        self.lmdb_dataset = LMDBDataset(path)
-        
+
+        self.lmdb_dataset = LMDBDataset_index(path)
+
         self.max_atoms = max_atoms
         ## the following is the default setting of uni-mol's pretrained weights
         self.remove_hydrogen = True
@@ -169,28 +176,28 @@ class D3Dataset(Dataset):
         self.normalize_coords = True
         self.add_special_token = True
         self.__max_atoms = 512
-    
+
     def __len__(self):
         return len(self.lmdb_dataset)
-    
+
     def __getitem__(self, index):
         data = self.lmdb_dataset[index]
         smiles = data['smi']
         ## deal with 3d coordinates
         atoms_orig = np.array(data['atoms'])
         atoms = atoms_orig.copy()
-        coordinate_set = data['coordinates']
+        coordinate_set = data['coordinates_list']
         coordinates = random.sample(coordinate_set, 1)[0].astype(np.float32)
-
-
         assert len(atoms) == len(coordinates) and len(atoms) > 0
         assert coordinates.shape[1] == 3
 
-        # deal with the hydrogen
+        ## deal with the hydrogen
         if self.remove_hydrogen:
             mask_hydrogen = atoms != "H"
-            atoms = atoms[mask_hydrogen]
-            coordinates = coordinates[mask_hydrogen]
+            if sum(mask_hydrogen) > 0:
+                atoms = atoms[mask_hydrogen]
+                coordinates = coordinates[mask_hydrogen]
+
         if not self.remove_hydrogen and self.remove_polar_hydrogen:
             end_idx = 0
             for i, atom in enumerate(atoms[::-1]):
@@ -201,120 +208,29 @@ class D3Dataset(Dataset):
             if end_idx != 0:
                 atoms = atoms[:-end_idx]
                 coordinates = coordinates[:-end_idx]
+
         ## deal with cropping
         if self.max_atoms > 0 and len(atoms) > self.max_atoms:
             index = np.random.permutation(len(atoms))[:self.max_atoms]
             atoms = atoms[index]
             coordinates = coordinates[index]
-        if len(atoms) == 0: # if all atoms are H
-            atoms = np.array(data['atoms'])
-            coordinate_set = data['coordinates']
-            coordinates = random.sample(coordinate_set, 1)[0].astype(np.float32)
+
         assert 0 < len(atoms) < self.__max_atoms, print(len(atoms), atoms_orig, index)
         atom_vec = torch.from_numpy(self.dictionary.vec_index(atoms)).long()
-        
+
         if self.normalize_coords:
             coordinates = coordinates - coordinates.mean(axis=0)
-        
+
         if self.add_special_token:
             atom_vec = torch.cat([torch.LongTensor([self.bos]), atom_vec, torch.LongTensor([self.eos])])
             coordinates = np.concatenate([np.zeros((1, 3)), coordinates, np.zeros((1, 3))], axis=0)
-        
+
         ## obtain edge types; which is defined as the combination of two atom types
         edge_type = atom_vec.view(-1, 1) * self.num_types + atom_vec.view(1, -1)
         dist = distance_matrix(coordinates, coordinates).astype(np.float32)
         coordinates, dist = torch.from_numpy(coordinates), torch.from_numpy(dist)
         return atom_vec, coordinates, edge_type, dist, smiles
-
-class D3Dataset_Pro(Dataset):
-    def __init__(self, path, dictionary, max_atoms=256):
-        self.dictionary = dictionary
-        self.num_types = len(dictionary)
-        self.bos = dictionary.bos()
-        self.eos = dictionary.eos()
         
-        self.lmdb_dataset = LMDBDataset(path)
-        
-        self.max_atoms = max_atoms
-        ## the following is the default setting of uni-mol's pretrained weights
-        self.remove_hydrogen = True
-        self.remove_polar_hydrogen = False
-        self.normalize_coords = True
-        self.add_special_token = True
-        self.__max_atoms = 512
-    
-    def __len__(self):
-        return len(self.lmdb_dataset)
-    
-    def __getitem__(self, index):
-        # FIXME
-        while len(self.lmdb_dataset[index]['atoms'])==0:
-            print('bad_case', index)
-            index = random.randint(0,len(self)-1)
-        data = self.lmdb_dataset[index]
-
-        ## deal with 3d coordinates
-        atoms_orig = np.array(data['atoms'])
-        atoms = atoms_orig.copy()
-        # only using dict_coarse so replace CA with C
-        atoms = np.array([a[0] for a in atoms])
-
-        coordinate_set = data['coordinates']
-        coordinates = random.sample(coordinate_set, 1)[0].astype(np.float32)
-        residues = np.array(data['residue'])
-        #print(len(atoms), len(coordinates), len(atoms))
-        assert len(atoms) == len(coordinates) and len(atoms) > 0, f'{len(atoms)}, {len(coordinates)}, {len(atoms)}'
-        assert coordinates.shape[1] == 3
-
-        ## deal with the hydrogen
-        if len(atoms) != len(residues):
-            min_len = min(len(atoms), len(residues))
-            atoms = atoms[:min_len]
-            residues = residues[:min_len]
-            coordinates = coordinates[:min_len, :]
-        if self.remove_hydrogen:
-            mask_hydrogen = atoms != "H"
-            atoms = atoms[mask_hydrogen]
-            residues = residues[mask_hydrogen]
-            coordinates = coordinates[mask_hydrogen]
-
-        ## deal with cropping
-        # crop atoms according to their distance to the center of pockets
-        if self.max_atoms and len(atoms) > self.max_atoms:
-            distance = np.linalg.norm(
-                coordinates - coordinates.mean(axis=0), axis=1
-            )
-            def softmax(x):
-                x -= np.max(x)
-                x = np.exp(x) / np.sum(np.exp(x))
-                return x
-            distance += 1  # prevent inf
-            weight = softmax(np.reciprocal(distance))
-            index = np.random.choice(
-                len(atoms), self.max_atoms, replace=False, p=weight
-            )
-            atoms = atoms[index]
-            coordinates = coordinates[index]
-            residues = residues[index]
-        if self.max_atoms > 0 and len(atoms) > self.max_atoms:
-            index = np.random.permutation(len(atoms))[:self.max_atoms]
-            atoms = atoms[index]
-            coordinates = coordinates[index]
-            residues = residues[index]
-        assert 0 < len(atoms) < self.__max_atoms, print(len(atoms), atoms_orig, index)
-        atom_vec = torch.from_numpy(self.dictionary.vec_index(atoms)).long()
-
-        if self.normalize_coords:
-            coordinates = coordinates - coordinates.mean(axis=0)
-        if self.add_special_token:
-            atom_vec = torch.cat([torch.LongTensor([self.bos]), atom_vec, torch.LongTensor([self.eos])])
-            coordinates = np.concatenate([np.zeros((1, 3)), coordinates, np.zeros((1, 3))], axis=0)
-        
-        ## obtain edge types; which is defined as the combination of two atom types
-        edge_type = atom_vec.view(-1, 1) * self.num_types + atom_vec.view(1, -1)
-        dist = distance_matrix(coordinates, coordinates).astype(np.float32)
-        coordinates, dist = torch.from_numpy(coordinates), torch.from_numpy(dist)
-        return atom_vec, coordinates, edge_type, dist, residues
 
 def collate_tokens_coords(
     values,
@@ -345,41 +261,46 @@ class D3Collater:
         self.pad_to_multiple = pad_to_multiple
     
     def __call__(self, samples):
-        atom_vec, coordinates, edge_type, dist, smiles = zip(*samples)
+        atom_vec, coordinates, edge_type, dist, smiles, _, enriched_descriptions = zip(*samples)
         padded_atom_vec = data_utils.collate_tokens(atom_vec, self.pad_idx, left_pad=False, pad_to_multiple=self.pad_to_multiple) # shape = [batch_size, max_atoms]
         padded_coordinates = collate_tokens_coords(coordinates, 0, left_pad=False, pad_to_multiple=self.pad_to_multiple) # shape = [batch_size, max_atoms, 3]
         padded_edge_type = data_utils.collate_tokens_2d(edge_type, 0, left_pad=False, pad_to_multiple=self.pad_to_multiple) # shape = [batch_size, max_atoms, max_atoms]
         padded_dist = data_utils.collate_tokens_2d(dist, 0, left_pad=False, pad_to_multiple=self.pad_to_multiple) # shape = [batch_size, max_atoms, max_atoms]
-        return padded_atom_vec, padded_coordinates, padded_edge_type, padded_dist, smiles
-class D3Collater_Pro:
-    def __init__(self, pad_idx, pad_to_multiple=8):
-        self.pad_idx = pad_idx
-        self.pad_to_multiple = pad_to_multiple
-    
-    def __call__(self, samples):
-        atom_vec, coordinates, edge_type, dist, residues = zip(*samples)
-        padded_atom_vec = data_utils.collate_tokens(atom_vec, self.pad_idx, left_pad=False, pad_to_multiple=self.pad_to_multiple) # shape = [batch_size, max_atoms]
-        padded_coordinates = collate_tokens_coords(coordinates, 0, left_pad=False, pad_to_multiple=self.pad_to_multiple) # shape = [batch_size, max_atoms, 3]
-        padded_edge_type = data_utils.collate_tokens_2d(edge_type, 0, left_pad=False, pad_to_multiple=self.pad_to_multiple) # shape = [batch_size, max_atoms, max_atoms]
-        padded_dist = data_utils.collate_tokens_2d(dist, 0, left_pad=False, pad_to_multiple=self.pad_to_multiple) # shape = [batch_size, max_atoms, max_atoms]
-        return padded_atom_vec, padded_coordinates, padded_edge_type, padded_dist, residues
+        return padded_atom_vec, padded_coordinates, padded_edge_type, padded_dist, smiles, enriched_descriptions
+
+
+def batch_provider(data_path, bert_name):
+    dictionary = Dictionary.load('unimol_dict_mol.txt')
+    lmdb_dataset = LMDBDataset_cid(data_path)
+    d3_dataset = D3Dataset_cid(data_path, dictionary, max_atoms=64)  # Number of molecules : 301658
+
+    random_cids = random.sample(lmdb_dataset._keys, 56)  # Choose 56 random keys
+    random_cids = [cid.decode("utf-8") for cid in random_cids]  # Decode the keys
+
+    batch = [d3_dataset[cid] for cid in random_cids]  # Retrieve tuples
+
+    Collater = D3Collater(pad_idx=0, pad_to_multiple=64)
+    padded_atom_vec, padded_coordinates, padded_edge_type, padded_dist, smiles_list, enriched_description_list = Collater(batch)
+
+    if smiles_list[0][:5] == "[CLS]":    smiles_list = [s[5:] for s in smiles_list]
+    smile_tokenizer = regexTokenizer(vocab_path='./LDMol/vocab_bpe_300_sc.txt', max_len=127)
+    smile_tokens = smile_tokenizer(smiles_list).to(device)
+
+    tokenizer = init_tokenizer(bert_name)
+    tokenized_inputs = tokenizer(enriched_description_list, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    text_token_ids = tokenized_inputs['input_ids'].to(device); text_attention_mask = tokenized_inputs['attention_mask'].to(device)
+
+    return smile_tokens, padded_atom_vec.to(device), padded_dist.to(device), padded_edge_type.to(device), text_token_ids, text_attention_mask
+
 
 if __name__ == '__main__':
     from unicore.data import Dictionary
     from torch.utils.data import DataLoader
     # split_path = os.path.join(self.args.data, self.args.task_name, split + ".lmdb")
-    path = '/data/lish/MolGLA/MolChat/data/mola-d-v2/molecule3d_database.lmdb'
+    path = '/data/lish/3D-MoLM/MolChat/data/mola-d-v2/molecule3d_database.lmdb'
     dictionary = Dictionary.load('/data/lish/zyliu/MolChat/data_provider/unimol_dict.txt')
     dictionary.add_symbol("[MASK]", is_special=True)
     dataset = D3Dataset_cid(path, dictionary, 256)
     pass
-    # dataloader = DataLoader(dataset, batch_size=16, shuffle=False, num_workers=0, collate_fn=D3Collater(dictionary.pad()))
-    # for batch in dataloader:
-    #     atom_vec, coordinates, edge_type, dist, smiles = batch
-    #     print(atom_vec.shape)
-    #     print(coordinates.shape)
-    #     print(edge_type.shape)
-    #     print(dist.shape)
-    #     print(smiles)
-    #     input()
+
 
